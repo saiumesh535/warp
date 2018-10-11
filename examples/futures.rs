@@ -14,7 +14,7 @@ fn main() {
             if seconds <= 5 {
                 Ok(seconds)
             } else {
-                Err(warp::reject())
+                Err(warp::reject::bad_request())
             }
         })
         // and_then create a `Future` that will simply wait 3 seconds...

@@ -20,7 +20,7 @@
 //! let route = warp::path::param()
 //!     .and_then(|id: u32| {
 //!         if id == 0 {
-//!             Err(warp::reject())
+//!             Err(warp::reject::bad_request())
 //!         } else {
 //!             Ok("something since id is valid")
 //!         }
@@ -28,8 +28,9 @@
 //! ```
 
 use std::error::Error as StdError;
+use std::fmt;
 
-use http;
+use http::{self, StatusCode};
 use serde;
 use serde_json;
 
@@ -40,7 +41,8 @@ pub(crate) use self::sealed::{CombineRejection, Reject};
 /// Error cause for a rejection.
 pub type Cause = Box<StdError + Send + Sync>;
 
-/// Rejects a request with a default `400 Bad Request`.
+#[doc(hidden)]
+#[deprecated(note = "this will be changed to return a NotFound rejection, use warp::reject::bad_request() to keep the old behavior")]
 #[inline]
 pub fn reject() -> Rejection {
     bad_request()
@@ -49,37 +51,39 @@ pub fn reject() -> Rejection {
 /// Rejects a request with `400 Bad Request`.
 #[inline]
 pub fn bad_request() -> Rejection {
-    Reason::BAD_REQUEST.into()
+    Rejection::other(Status(StatusCode::BAD_REQUEST))
 }
 
 /// Rejects a request with `403 Forbidden`
 #[inline]
 pub fn forbidden() -> Rejection {
-    Reason::FORBIDDEN.into()
+    Rejection::other(Status(StatusCode::FORBIDDEN))
 }
 
 /// Rejects a request with `404 Not Found`.
 #[inline]
 pub fn not_found() -> Rejection {
-    Reason::empty().into()
+    Rejection {
+        reason: Reason::NotFound,
+    }
 }
 
 // 405 Method Not Allowed
 #[inline]
 pub(crate) fn method_not_allowed() -> Rejection {
-    Reason::METHOD_NOT_ALLOWED.into()
+    Rejection::other(Status(StatusCode::METHOD_NOT_ALLOWED))
 }
 
 // 411 Length Required
 #[inline]
 pub(crate) fn length_required() -> Rejection {
-    Reason::LENGTH_REQUIRED.into()
+    Rejection::other(Status(StatusCode::LENGTH_REQUIRED))
 }
 
 // 413 Payload Too Large
 #[inline]
 pub(crate) fn payload_too_large() -> Rejection {
-    Reason::PAYLOAD_TOO_LARGE.into()
+    Rejection::other(Status(StatusCode::PAYLOAD_TOO_LARGE))
 }
 
 // 415 Unsupported Media Type
@@ -88,40 +92,45 @@ pub(crate) fn payload_too_large() -> Rejection {
 // what can be deserialized.
 #[inline]
 pub(crate) fn unsupported_media_type() -> Rejection {
-    Reason::UNSUPPORTED_MEDIA_TYPE.into()
+    Rejection::other(Status(StatusCode::UNSUPPORTED_MEDIA_TYPE))
 }
 
 /// Rejects a request with `500 Internal Server Error`.
 #[inline]
 pub fn server_error() -> Rejection {
-    Reason::SERVER_ERROR.into()
+    Rejection::other(Status(StatusCode::INTERNAL_SERVER_ERROR))
 }
 
-/// Rejection of a request by a [`Filter`](::Filter).
-#[derive(Debug)]
-pub struct Rejection {
-    reason: Reason,
-    cause: Option<Cause>,
-}
 
-bitflags! {
-    struct Reason: u8 {
-        // NOT_FOUND = 0
-        const BAD_REQUEST            = 0b00000001;
-        const METHOD_NOT_ALLOWED     = 0b00000010;
-        const LENGTH_REQUIRED        = 0b00000100;
-        const PAYLOAD_TOO_LARGE      = 0b00001000;
-        const UNSUPPORTED_MEDIA_TYPE = 0b00010000;
-        const FORBIDDEN              = 0b00100000;
-
-        // SERVER_ERROR has to be the last reason, to avoid shadowing it when combining rejections
-        const SERVER_ERROR           = 0b10000000;
+/// Rejects a request with a specific status code.
+#[inline]
+pub fn status(status: StatusCode) -> Rejection {
+    if status == StatusCode::NOT_FOUND {
+        not_found()
+    } else {
+        Rejection::other(Status(status))
     }
 }
 
+/// Rejection of a request by a [`Filter`](::Filter).
+pub struct Rejection {
+    reason: Reason,
+}
+
+enum Reason {
+    NotFound,
+    Other(Box<self::sealed::BoxedReject>),
+}
+
 impl Rejection {
+    fn other<E: Reject + Send + Sync + 'static>(other: E) -> Self {
+        Rejection {
+            reason: Reason::Other(Box::new(other)),
+        }
+    }
+
     /// Return the HTTP status code that this rejection represents.
-    pub fn status(&self) -> http::StatusCode {
+    pub fn status(&self) -> StatusCode {
         Reject::status(self)
     }
 
@@ -130,10 +139,10 @@ impl Rejection {
     where
         E: Into<Cause>,
     {
-        let cause = Some(err.into());
+        let cause = err.into();
+
         Self {
-            cause,
-            .. self
+            reason: Reason::Other(Box::new(With(self, cause)))
         }
     }
 
@@ -158,40 +167,19 @@ impl Rejection {
 
     /// Returns an error cause.
     pub fn cause(&self) -> Option<&Cause> {
-        if let Some(ref err) = self.cause {
-            return Some(&err)
+        if let Reason::Other(ref err) = self.reason {
+            return err.cause()
         }
         None
     }
 
-    /// Turn into cause of type `T`.
+    #[doc(hidden)]
+    #[deprecated(note = "into_cause can no longer be provided")]
     pub fn into_cause<T>(self) -> Result<Box<T>, Self>
     where
         T: StdError + Send + Sync + 'static
     {
-        let err = match self.cause {
-            Some(err) => err,
-            None => return Err(self)
-        };
-
-        match err.downcast::<T>() {
-            Ok(err) => Ok(err),
-            Err(other) => Err(Rejection {
-                reason: self.reason,
-                cause: Some(other)
-            })
-        }
-    }
-}
-
-#[doc(hidden)]
-impl From<Reason> for Rejection {
-    #[inline]
-    fn from(reason: Reason) -> Rejection {
-        Rejection {
-            reason,
-            cause: None,
-        }
+        Err(self)
     }
 }
 
@@ -203,7 +191,7 @@ impl From<Never> for Rejection {
 }
 
 impl Reject for Never {
-    fn status(&self) -> http::StatusCode {
+    fn status(&self) -> StatusCode {
         match *self {}
     }
 
@@ -217,50 +205,89 @@ impl Reject for Never {
 }
 
 impl Reject for Rejection {
-    fn status(&self) -> http::StatusCode {
-        if self.reason.contains(Reason::SERVER_ERROR) {
-            http::StatusCode::INTERNAL_SERVER_ERROR
-        } else if self.reason.contains(Reason::FORBIDDEN) {
-            http::StatusCode::FORBIDDEN
-        } else if self.reason.contains(Reason::UNSUPPORTED_MEDIA_TYPE) {
-            http::StatusCode::UNSUPPORTED_MEDIA_TYPE
-        } else if self.reason.contains(Reason::LENGTH_REQUIRED) {
-            http::StatusCode::LENGTH_REQUIRED
-        } else if self.reason.contains(Reason::PAYLOAD_TOO_LARGE) {
-            http::StatusCode::PAYLOAD_TOO_LARGE
-        } else if self.reason.contains(Reason::BAD_REQUEST) {
-            http::StatusCode::BAD_REQUEST
-        } else if self.reason.contains(Reason::METHOD_NOT_ALLOWED) {
-            http::StatusCode::METHOD_NOT_ALLOWED
-        } else {
-            debug_assert!(self.reason.is_empty());
-            http::StatusCode::NOT_FOUND
+    fn status(&self) -> StatusCode {
+        match self.reason {
+            Reason::NotFound => StatusCode::NOT_FOUND,
+            Reason::Other(ref other) => other.status(),
         }
+    }
+
+    fn into_response(self) -> ::reply::Response {
+        match self.reason {
+            Reason::NotFound => {
+                let mut res = http::Response::default();
+                *res.status_mut() = StatusCode::NOT_FOUND;
+                res
+            },
+            Reason::Other(other) => other.into_response(),
+        }
+    }
+
+    #[inline]
+    fn cause(&self) -> Option<&Cause> {
+        Rejection::cause(&self)
+    }
+}
+
+impl fmt::Debug for Rejection {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_tuple("Rejection")
+            .field(&self.reason)
+            .finish()
+    }
+}
+
+impl fmt::Debug for Reason {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Reason::NotFound => f.write_str("NotFound"),
+            Reason::Other(ref other) => fmt::Debug::fmt(other, f),
+
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Status(StatusCode);
+
+impl Reject for Status {
+    fn status(&self) -> StatusCode {
+        self.0
+    }
+
+    fn into_response(self) -> ::reply::Response {
+        use ::reply::ReplySealed;
+        self.0.into_response()
+    }
+
+    fn cause(&self) -> Option<&Cause> {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct With<R: Reject>(R, Cause);
+
+impl<R: Reject> Reject for With<R> {
+    fn status(&self) -> StatusCode {
+        self.0.status()
     }
 
     fn into_response(self) -> ::reply::Response {
         use http::header::{CONTENT_TYPE, HeaderValue};
         use hyper::Body;
 
-        let code = self.status();
-        let mut res = http::Response::default();
-        *res.status_mut() = code;
+        let mut res = self.0.into_response();
 
-        match self.cause {
-            Some(err) => {
-                let bytes = format!("{}", err);
-                res.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-                *res.body_mut() = Body::from(bytes);
-            },
-            None => {}
-        }
+        let bytes = self.1.to_string();
+        res.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        *res.body_mut() = Body::from(bytes);
 
         res
     }
 
-    #[inline]
     fn cause(&self) -> Option<&Cause> {
-        Rejection::cause(&self)
+        Some(&self.1)
     }
 }
 
@@ -272,8 +299,8 @@ impl serde::Serialize for Rejection {
         use serde::ser::SerializeMap;
 
         let mut map = serializer.serialize_map(None)?;
-        let err = match self.cause {
-            Some(ref err) => err,
+        let err = match self.cause() {
+            Some(err) => err,
             None => return map.end()
         };
 
@@ -284,17 +311,50 @@ impl serde::Serialize for Rejection {
 }
 
 mod sealed {
+    use http::StatusCode;
     use ::never::Never;
-    use super::{Cause, Rejection};
+    use super::{Cause, Reason, Rejection};
 
-    pub trait Reject: ::std::fmt::Debug + Send {
-        fn status(&self) -> ::http::StatusCode;
+    pub trait Reject: ::std::fmt::Debug + Send + Sync {
+        fn status(&self) -> StatusCode;
         fn into_response(self) -> ::reply::Response;
-        fn cause(&self) -> Option<&Cause>;
+        fn cause(&self) -> Option<&Cause> { None }
+    }
+
+    pub(super) trait BoxedReject: ::std::fmt::Debug + Send + Sync {
+        fn boxed_status(&self) -> StatusCode;
+        fn boxed_response(self: Box<Self>) -> ::reply::Response;
+        fn boxed_cause(&self) -> Option<&Cause>;
+    }
+
+    impl<T: Reject> BoxedReject for T {
+        fn boxed_status(&self) -> StatusCode {
+            self.status()
+        }
+        fn boxed_response(self: Box<Self>) -> ::reply::Response {
+            self.into_response()
+        }
+        fn boxed_cause(&self) -> Option<&Cause> {
+            self.cause()
+        }
+    }
+
+    impl Reject for Box<BoxedReject> {
+        fn status(&self) -> StatusCode {
+            (**self).boxed_status()
+        }
+        fn into_response(self) -> ::reply::Response {
+            self.boxed_response()
+        }
+        fn cause(&self) -> Option<&Cause> {
+            (**self).boxed_cause()
+        }
     }
 
     fn _assert_object_safe() {
         fn _assert(_: &Reject) {}
+        fn is_reject<T: Reject>() {}
+        is_reject::<Box<BoxedReject>>();
     }
 
     pub trait CombineRejection<E>: Send + Sized {
@@ -307,16 +367,22 @@ mod sealed {
         type Rejection = Rejection;
 
         fn combine(self, other: Rejection) -> Self::Rejection {
-            let reason = self.reason | other.reason;
-            let cause = if self.reason > other.reason {
-                self.cause
-            } else {
-                other.cause
+            let reason = match (self.reason, other.reason) {
+                (Reason::Other(left), Reason::Other(right)) => {
+                    Reason::Other(Box::new(Combined(left, right)))
+                },
+                (Reason::Other(other), Reason::NotFound) |
+                (Reason::NotFound, Reason::Other(other)) => {
+                    // ignore the NotFound
+                    Reason::Other(other)
+                },
+                (Reason::NotFound, Reason::NotFound) => {
+                    Reason::NotFound
+                }
             };
 
             Rejection {
                 reason,
-                cause
             }
         }
     }
@@ -342,6 +408,53 @@ mod sealed {
 
         fn combine(self, _: Never) -> Self::Rejection {
             match self {}
+        }
+    }
+
+    #[derive(Debug)]
+    struct Combined<A, B>(A, B);
+
+    impl<A: Reject, B: Reject> Combined<A, B> {
+        fn prefer_a(&self) -> bool {
+            // Compare status codes, with this priority:
+            // - NOT_FOUND is lowest
+            // - METHOD_NOT_ALLOWED is second
+            // - if one status code is greater than the other
+            // - otherwise, prefer A...
+            match (self.0.status(), self.1.status()) {
+                (_, StatusCode::NOT_FOUND) => true,
+                (StatusCode::NOT_FOUND, _) => false,
+                (_, StatusCode::METHOD_NOT_ALLOWED) => true,
+                (StatusCode::METHOD_NOT_ALLOWED, _) => false,
+                (a, b) if a < b => false,
+                _ => true,
+            }
+        }
+    }
+
+    impl<A: Reject, B: Reject> Reject for Combined<A, B> {
+        fn status(&self) -> StatusCode {
+            if self.prefer_a() {
+                self.0.status()
+            } else {
+                self.1.status()
+            }
+        }
+
+        fn into_response(self) -> ::reply::Response {
+            if self.prefer_a() {
+                self.0.into_response()
+            } else {
+                self.1.into_response()
+            }
+        }
+
+        fn cause(&self) -> Option<&Cause> {
+            if self.prefer_a() {
+                self.0.cause()
+            } else {
+                self.1.cause()
+            }
         }
     }
 }
@@ -371,33 +484,38 @@ mod tests {
         let right = server_error().with("right");
         let reject = left.combine(right);
 
-        assert_eq!(Reason::BAD_REQUEST | Reason::SERVER_ERROR, reject.reason);
-        match reject.cause {
-            Some(err) => assert_eq!("right", err.description()),
-            err => unreachable!("{:?}", err)
-        }
+        assert_eq!(reject.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(reject.cause().unwrap().to_string(), "right");
+    }
+
+    #[test]
+    fn combine_rejection_causes_with_some_left_and_none_server_error() {
+        let left = bad_request().with("left");
+        let right = server_error();
+        let reject = left.combine(right);
+
+        assert_eq!(reject.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(reject.cause().is_none());
     }
 
     #[test]
     fn combine_rejection_causes_with_some_left_and_none_right() {
         let left = bad_request().with("left");
-        let right = server_error();
+        let right = bad_request();
+        let reject = left.combine(right);
 
-        match left.combine(right).cause {
-            None => {},
-            err => unreachable!("{:?}", err)
-        }
+        assert_eq!(reject.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(reject.cause().unwrap().to_string(), "left");
     }
 
     #[test]
     fn combine_rejection_causes_with_none_left_and_some_right() {
         let left = bad_request();
         let right = server_error().with("right");
+        let reject = left.combine(right);
 
-        match left.combine(right).cause {
-            Some(err) => assert_eq!("right", err.description()),
-            err => unreachable!("{:?}", err)
-        }
+        assert_eq!(reject.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(reject.cause().unwrap().to_string(), "right");
     }
 
     #[test]
@@ -443,5 +561,26 @@ mod tests {
             },
             err => unreachable!("{:?}", err)
         }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn into_cause() {
+        use std::io;
+
+        let reject = bad_request()
+            .with(io::Error::new(io::ErrorKind::Other, "boom"));
+
+        reject
+            .into_cause::<io::Error>()
+            .unwrap_err();
+    }
+
+    #[test]
+    fn size_of_rejection() {
+        assert_eq!(
+            ::std::mem::size_of::<Rejection>(),
+            ::std::mem::size_of::<(usize, usize)>(),
+        );
     }
 }
